@@ -42,70 +42,64 @@ function readFile(sftp, remotePath) {
 }
 
 async function main() {
-  console.log('=== SFTP RECON (read-only) ===');
+  console.log('=== 835 CLAIM-BLOCK DUMP (read-only) ===');
   const { conn, sftp } = await connectSftp();
   console.log('Connected.\n');
 
-  // 1. List root directory to discover folder names
-  console.log('--- ROOT DIRECTORY ---');
-  let rootList = [];
-  try {
-    rootList = await readdir(sftp, '/');
-    for (const f of rootList) {
-      const isDir = f.attrs && f.attrs.isDirectory && f.attrs.isDirectory();
-      console.log(`${isDir ? '[DIR] ' : '[file]'} ${f.filename}`);
+  // Grab a recent 835 with real dollars. Pick a 13337.* file (those had paid claims).
+  const list = await readdir(sftp, '/Download');
+  const era = list
+    .map(f => f.filename)
+    .filter(n => /\.ERA\.835\.edi$/i.test(n))
+    .sort();
+
+  // Prefer a 13337 file from a date we know had money
+  const target = era.find(n => /^13337\..*20260610/.test(n))
+              || era.find(n => /^13337\./.test(n))
+              || era[0];
+
+  console.log(`Chosen file: ${target}\n`);
+  const content = await readFile(sftp, `/Download/${target}`);
+
+  const elemSep = content[3] || '|';
+  const segTerm = content[105] || '~';
+  console.log(`elemSep="${elemSep}"  segTerm="${segTerm}"  length=${content.length}\n`);
+
+  const segs = content.split(segTerm).map(s => s.trim()).filter(Boolean);
+
+  // Print every segment from file start through the end of the 2nd CLP claim block,
+  // so we can see ISA/GS/ST/BPR/N1 headers + 2 full CLP..CLP claim blocks
+  // (CLP, CAS, NM1, SVC, DTM, REF, AMT, etc).
+  let clpCount = 0;
+  console.log('--- SEGMENTS (header through 2nd claim block) ---');
+  for (let i = 0; i < segs.length; i++) {
+    const id = segs[i].split(elemSep)[0];
+    if (id === 'CLP') {
+      clpCount++;
+      if (clpCount > 2) { console.log('...(stopping after 2 claim blocks)...'); break; }
     }
-  } catch (e) { console.log(`root readdir error: ${e.message}`); }
-  console.log('');
-
-  // 2. Probe likely upload folder names for 837 files
-  const candidates = ['/Upload', '/upload', '/Uploads', '/Outbound', '/outbound', '/Sent', '/837'];
-  // also add any dirs discovered at root
-  for (const f of rootList) {
-    const isDir = f.attrs && f.attrs.isDirectory && f.attrs.isDirectory();
-    if (isDir && !candidates.includes('/' + f.filename)) candidates.push('/' + f.filename);
+    console.log(segs[i]);
   }
 
-  let found837 = null;
-  for (const dir of candidates) {
-    let list;
-    try { list = await readdir(sftp, dir); }
-    catch { continue; } // folder doesn't exist, skip silently
-    console.log(`--- ${dir} (${list.length} files) ---`);
-    const names = list.map(f => f.filename);
-    console.log('Sample names: ' + names.slice(0, 15).join(', '));
+  console.log('\n--- ALL UNIQUE SEGMENT IDS IN FILE ---');
+  const ids = [...new Set(segs.map(s => s.split(elemSep)[0]))];
+  console.log(ids.join(', '));
 
-    // Heuristics for an 837 claim file
-    const cand = list.find(f => /837/i.test(f.filename) || /\.CLM|\.claim|\.txt$/i.test(f.filename));
-    if (cand && !found837) {
-      found837 = `${dir}/${cand.filename}`.replace('//', '/');
+  // Also surface a denied/adjusted claim if one exists (CLP02 != 1)
+  console.log('\n--- FIRST NON-PAID (denied/partial) CLAIM BLOCK, if any ---');
+  let printing = false, printed = false;
+  for (let i = 0; i < segs.length && !printed; i++) {
+    const parts = segs[i].split(elemSep);
+    if (parts[0] === 'CLP') {
+      if (printing) { printed = true; break; }   // reached next claim, stop
+      if (parts[2] && parts[2] !== '1') printing = true;  // status not "paid"
     }
-    console.log('');
+    if (printing) console.log(segs[i]);
   }
-
-  // 3. Dump the structure of one 837 (first ~2500 chars), if found
-  if (found837) {
-    console.log(`=== DUMPING 837 STRUCTURE: ${found837} ===`);
-    try {
-      const content = await readFile(sftp, found837);
-      console.log(`Length: ${content.length} bytes\n`);
-      console.log('--- FIRST 2500 CHARS ---');
-      console.log(content.substring(0, 2500));
-      console.log('\n--- SEGMENT IDS PRESENT ---');
-      const segTerm = content[105] || '~';
-      const elemSep = content[3] || '*';
-      const ids = [...new Set(content.split(segTerm)
-        .map(s => s.trim().split(elemSep)[0]).filter(Boolean))];
-      console.log(`elemSep="${elemSep}" segTerm="${segTerm}"`);
-      console.log('Segment IDs: ' + ids.join(', '));
-    } catch (e) { console.log(`read error: ${e.message}`); }
-  } else {
-    console.log('No obvious 837 file found in probed folders.');
-    console.log('Review the folder listings above to identify where 837s live.');
-  }
+  if (!printing && !printed) console.log('(no non-paid claim found in this file)');
 
   conn.end();
-  console.log('\n=== RECON DONE ===');
+  console.log('\n=== DUMP DONE ===');
 }
 
 main().catch(e => { console.error('FAILED: ' + e.message); process.exit(1); });
