@@ -196,7 +196,7 @@ async function upsertPayments(records) {
     const chunk = records.slice(i, i + chunkSize);
     console.log(`Upserting payments ${i}–${Math.min(i+chunkSize, records.length)} of ${records.length}…`);
 
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/payments`, {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/payments?on_conflict=claim_id,source_file,cpt_code`, {
       method: 'POST',
       headers: SB_H,
       body: JSON.stringify(chunk.map(r => ({
@@ -213,6 +213,7 @@ async function upsertPayments(records) {
         payments:     r.payments,
         adjustments:  r.adjustments,
         writeoff:     r.writeoff,
+        source_file:  r.source_file,
       })))
     });
 
