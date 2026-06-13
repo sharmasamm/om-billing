@@ -12,7 +12,7 @@ jobs:
         with:
           node-version: '20'
       - run: npm install node-fetch ssh2
-      - run: node recon.js
+      - run: node waystar-sync.js
         env:
           WAYSTAR_HOST: ${{ secrets.WAYSTAR_HOST }}
           WAYSTAR_USER: ${{ secrets.WAYSTAR_USER }}
