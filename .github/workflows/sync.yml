@@ -1,0 +1,23 @@
+name: Waystar 835 → Supabase Sync
+
+on:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+jobs:
+  waystar-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install node-fetch ssh2
+      - run: node waystar-sync.js
+        env:
+          WAYSTAR_HOST: ${{ secrets.WAYSTAR_HOST }}
+          WAYSTAR_USER: ${{ secrets.WAYSTAR_USER }}
+          WAYSTAR_PASS: ${{ secrets.WAYSTAR_PASS }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
