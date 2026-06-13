@@ -10,8 +10,7 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const SB_H = {
   'apikey': SUPABASE_KEY,
   'Authorization': 'Bearer ' + SUPABASE_KEY,
-  'Content-Type': 'application/json',
-  'Prefer': 'resolution=merge-duplicates'
+  'Content-Type': 'application/json'
 };
 
 // ── SFTP: list and download 835 files (SEQUENTIAL) ────────────
@@ -196,7 +195,7 @@ async function upsertPayments(records) {
     const chunk = records.slice(i, i + chunkSize);
     console.log(`Upserting payments ${i}–${Math.min(i+chunkSize, records.length)} of ${records.length}…`);
 
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/payments?on_conflict=claim_id,source_file,cpt_code`, {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/payments`, {
       method: 'POST',
       headers: SB_H,
       body: JSON.stringify(chunk.map(r => ({
