@@ -41,10 +41,15 @@ async function sftpDownload() {
   console.log('SFTP connected to Waystar');
   const list = await readdir(sftp, '/Download');
   const era = list.filter(f => /\.ERA\.835\.edi$/i.test(f.filename));
-  console.log(`Found ${list.length} files in /Download, ${era.length} are 835/ERA files`);
+  const csr = list.filter(f => /\.CLP\.277\.edi$/i.test(f.filename));
+  console.log(`Found ${list.length} files: ${era.length} 835 remittances, ${csr.length} 277 claim-status`);
   const files = [];
   for (const f of era) {
-    try { files.push({ name: f.filename, content: await readFile(sftp, `/Download/${f.filename}`) }); }
+    try { files.push({ kind: '835', name: f.filename, content: await readFile(sftp, `/Download/${f.filename}`) }); }
+    catch (e) { console.error(`Error reading ${f.filename}: ${e.message}`); }
+  }
+  for (const f of csr) {
+    try { files.push({ kind: '277', name: f.filename, content: await readFile(sftp, `/Download/${f.filename}`) }); }
     catch (e) { console.error(`Error reading ${f.filename}: ${e.message}`); }
   }
   conn.end();
@@ -200,6 +205,81 @@ function parseDate835(d) {
   return `${d.substring(0,4)}-${d.substring(4,6)}-${d.substring(6,8)}`;
 }
 
+// ── PARSE 277 CLAIM STATUS ────────────────────────────────────
+function parse277(content, filename) {
+  const records = [];
+  if (!content || content.length < 106 || content.slice(0,3) !== 'ISA') {
+    console.log(`Skipping ${filename}: not a valid 277`);
+    return records;
+  }
+  const elemSep = content[3];
+  const segTerm = content[105];
+  const segs = content.split(segTerm).map(s => s.trim()).filter(Boolean);
+
+  const statusLabel = (stc) => {
+    const cat = (stc||'').split('^')[0];
+    const map = {A0:'Acknowledged',A1:'Accepted',A2:'Accepted (forwarded)',A3:'Returned/Rejected',
+      A4:'Rejected',A6:'Rejected (missing info)',A7:'Rejected (data error)',A8:'Rejected',
+      P1:'Pending',P2:'Pending',P3:'Pending',P4:'Pending',
+      F0:'Finalized',F1:'Finalized/Paid',F2:'Finalized/Denied',F3:'Finalized/Reversed',F4:'Finalized'};
+    return map[cat] || cat || '';
+  };
+  const isRejected = (stc) => /^A[34678]/.test((stc||'').split('^')[0]);
+
+  let fileDate = null, cur = null;
+  const push = () => { if (cur && cur.claim_id) records.push(cur); cur = null; };
+
+  for (const line of segs) {
+    const s = line.split(elemSep);
+    const id = s[0];
+    if (id === 'BHT') fileDate = parseDate835(s[4]);
+    if (id === 'NM1' && s[1] === 'QC') {
+      push();
+      cur = { claim_id:'', patient_last:s[3]||'', patient_first:s[4]||'',
+        member_id:(s[8]==='MI'?(s[9]||''):''), status_code:'', status_label:'', rejected:false,
+        status_date:null, dos:null, charge:0, account:'', source_file:filename };
+    }
+    if (!cur) continue;
+    if (id === 'TRN' && s[1] === '2') {
+      cur.claim_id = s[2] || '';
+      cur.account = (cur.claim_id.match(/^[A-Za-z]+/)||[''])[0];
+    }
+    if (id === 'STC') {
+      cur.status_code = s[1] || '';
+      cur.status_label = statusLabel(s[1]);
+      cur.rejected = isRejected(s[1]);
+      cur.status_date = parseDate835(s[2]) || fileDate;
+      cur.charge = parseFloat(s[4]) || 0;
+    }
+    if (id === 'DTP' && s[1] === '472') cur.dos = parseDate835((s[3]||'').split('-')[0]);
+  }
+  push();
+  console.log(`Parsed ${records.length} claim-status records from ${filename}`);
+  return records;
+}
+
+async function upsertClaims(records) {
+  if (!records.length) { console.log('No claim-status records to upsert'); return { synced: 0, errors: 0 }; }
+  const chunkSize = 500;
+  let synced = 0, errors = 0;
+  for (let i = 0; i < records.length; i += chunkSize) {
+    const chunk = records.slice(i, i + chunkSize);
+    console.log(`Upserting claims ${i}-${Math.min(i+chunkSize, records.length)} of ${records.length}...`);
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/claims?on_conflict=claim_id,source_file`, {
+      method: 'POST', headers: SB_H,
+      body: JSON.stringify(chunk.map(r => ({
+        claim_id: r.claim_id, account: r.account,
+        patient_last: r.patient_last, patient_first: r.patient_first, member_id: r.member_id,
+        status_code: r.status_code, status_label: r.status_label, rejected: r.rejected,
+        status_date: r.status_date, dos: r.dos, charge: r.charge, source_file: r.source_file
+      })))
+    });
+    if (!res.ok) { console.error(`Claims chunk error: ${await res.text()}`); errors += chunk.length; }
+    else synced += chunk.length;
+  }
+  return { synced, errors };
+}
+
 async function upsertPayments(records) {
   if (!records.length) { console.log('No records to upsert'); return { synced: 0, errors: 0 }; }
   const chunkSize = 500;
@@ -225,18 +305,27 @@ async function upsertPayments(records) {
 }
 
 async function main() {
-  console.log('=== OM Labs Waystar 835 -> Supabase Sync ===');
+  console.log('=== OM Labs Waystar 835 + 277 -> Supabase Sync ===');
   console.log(`Time: ${new Date().toISOString()}`);
   try {
     const files = await sftpDownload();
     console.log(`Downloaded ${files.length} files`);
     if (!files.length) { console.log('No files found'); return; }
-    let all = [];
-    for (const f of files) all = all.concat(parse835(f.content, f.name));
-    console.log(`\nTotal service lines parsed: ${all.length}`);
-    const { synced, errors } = await upsertPayments(all);
-    console.log(`✅ Done: ${synced} synced, ${errors} errors`);
-    if (errors > 0) process.exit(1);
+
+    let payLines = [], claimRecs = [];
+    for (const f of files) {
+      if (f.kind === '835') payLines = payLines.concat(parse835(f.content, f.name));
+      else if (f.kind === '277') claimRecs = claimRecs.concat(parse277(f.content, f.name));
+    }
+    console.log(`\nTotal: ${payLines.length} payment service-lines (835), ${claimRecs.length} claim-status records (277)`);
+
+    const p = await upsertPayments(payLines);
+    console.log(`835 → payments: ${p.synced} synced, ${p.errors} errors`);
+    const c = await upsertClaims(claimRecs);
+    console.log(`277 → claims:   ${c.synced} synced, ${c.errors} errors`);
+
+    console.log(`✅ Done.`);
+    if (p.errors > 0 || c.errors > 0) process.exit(1);
   } catch (e) {
     console.error(`❌ Sync failed: ${e.message}`);
     console.error(e.stack);
